@@ -5,6 +5,8 @@ import os
 from app.routes.auth_routes import auth_bp
 from app.routes.dashboard_routes import dashboard_bp
 from app.routes.scan_routes import scan_bp
+from app.routes.account_routes import account_bp
+from app.routes.delete_routes import delete_bp
 
 def create_app():
     # ✅ Load the .env file (important for JWT_SECRET_KEY)
@@ -17,7 +19,10 @@ def create_app():
 
     # Register routes
     app.register_blueprint(auth_bp, url_prefix='/api/auth')
-    app.register_blueprint(dashboard_bp, url_prefix="/api/dashboard")
-    app.register_blueprint(scan_bp, url_prefix="/api/scan")
+    app.register_blueprint(dashboard_bp, url_prefix='/api/dashboard')
+    app.register_blueprint(scan_bp, url_prefix='/api/scan')
+    app.register_blueprint(account_bp, url_prefix='/api/account')
+    app.register_blueprint(delete_bp, url_prefix='/api/delete')
+    
 
     return app

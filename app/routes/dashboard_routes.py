@@ -11,20 +11,28 @@ dashboard_bp = Blueprint('dashboard', __name__)
 def quick_scan(current_user):
     try:
         email = current_user['email']
-        email_key = email.replace(".", "_").replace("@", "_")
+        email_key = email.replace('.', '_').replace('@', '_')
 
-        all_data = db.get("scans")
-        user_scans = all_data.val()["scans"].get(email_key, {})
+        # Get full data once
+        all_data = db.get()
+        user_scans = all_data.val().get("scans", {}).get(email_key, {})
+
+        # Ensure it's a dict
+        if not isinstance(user_scans, dict):
+            user_scans = {}
 
         total = len(user_scans)
-        scams = sum(1 for item in user_scans.values() if item.get("status") in ["scam", "suspicious"])
+        scam_count = sum(
+            1 for scan in user_scans.values()
+            if scan.get("status") in ["scam", "suspicious"]
+        )
 
-        protection = 100 if total == 0 else round((1 - scams / total) * 100)
+        protection = 100 if total == 0 else round((1 - scam_count / total) * 100)
 
         return jsonify({
             "email": email,
             "totalScanned": total,
-            "scamsDetected": scams,
+            "scamsDetected": scam_count,
             "protectionPercent": protection
         }), 200
 
