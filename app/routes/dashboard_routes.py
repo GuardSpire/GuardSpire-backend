@@ -6,25 +6,29 @@ from app.utils.auth_decorator import token_required
 dashboard_bp = Blueprint('dashboard', __name__)
 
 #-------------------Quick Scan--------------------#
-@dashboard_bp.route('/dashboard/quick-scan', methods=['GET'])
+@dashboard_bp.route('/quick-scan', methods=['GET', 'OPTIONS'])
 @token_required
 def quick_scan(current_user):
     try:
         email = current_user['email']
         email_key = email.replace('.', '_').replace('@', '_')
 
-        # Get full data once
         all_data = db.get()
-        user_scans = all_data.val().get("scans", {}).get(email_key, {})
+        db_root = all_data.val() or {}
 
-        # Ensure it's a dict
-        if not isinstance(user_scans, dict):
+        user_scans_raw = db_root.get("scans", {}).get(email_key)
+
+        if isinstance(user_scans_raw, list):
+            user_scans = {str(i): entry for i, entry in enumerate(user_scans_raw)}
+        elif isinstance(user_scans_raw, dict):
+            user_scans = user_scans_raw
+        else:
             user_scans = {}
 
         total = len(user_scans)
         scam_count = sum(
             1 for scan in user_scans.values()
-            if scan.get("status") in ["scam", "suspicious"]
+            if isinstance(scan, dict) and scan.get("status") in ["scam", "suspicious"]
         )
 
         protection = 100 if total == 0 else round((1 - scam_count / total) * 100)
@@ -38,6 +42,7 @@ def quick_scan(current_user):
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 #-------------------Security Model--------------------#
 @dashboard_bp.route('/security-model', methods=['GET'])
@@ -88,11 +93,24 @@ def recent_alerts(current_user):
         email = current_user['email']
         email_key = email.replace(".", "_").replace("@", "_")
 
-        all_data = db.get("scam_records")
-        alerts = all_data.val()["scam_records"].get(email_key, {})
+        all_data = db.get("manual_scans")
+        all_scans = all_data.val().get("manual_scans", {})
 
-        alerts_sorted = sorted(alerts, key=lambda x: x.get("timestamp", ""), reverse=True)
-        recent = alerts_sorted[:5]
+        user_alerts = all_scans.get(email_key, {})
+
+        # Convert list-like to dict if needed
+        if isinstance(user_alerts, list):
+            user_alerts = {str(i): user_alerts[i] for i in range(len(user_alerts))}
+
+        # Sort by timestamp descending
+        sorted_alerts = sorted(
+            user_alerts.values(),
+            key=lambda x: x.get("timestamp", ""),
+            reverse=True
+        )
+
+        # Return the most recent 5
+        recent = sorted_alerts[:5]
 
         return jsonify({
             "email": email,
@@ -101,3 +119,4 @@ def recent_alerts(current_user):
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+

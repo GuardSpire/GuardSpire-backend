@@ -6,9 +6,10 @@ import os
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        token = None
+        if request.method == 'OPTIONS':
+            return '', 200
 
-        # Step 1: Get token from Authorization header
+        token = None
         if 'Authorization' in request.headers:
             auth_header = request.headers['Authorization']
             if auth_header.startswith('Bearer '):
@@ -18,9 +19,10 @@ def token_required(f):
             return jsonify({"error": "Missing Authorization header"}), 401
 
         try:
-            # Step 2: Decode token using your JWT secret key
             decoded_token = jwt.decode(token, os.getenv("JWT_SECRET_KEY"), algorithms=["HS256"])
-            current_user_email = decoded_token["email"]
+            current_user_email = decoded_token.get("email")
+            if not current_user_email:
+                return jsonify({"error": "Invalid token data"}), 401
 
         except jwt.ExpiredSignatureError:
             return jsonify({"error": "Token has expired"}), 401
@@ -29,7 +31,7 @@ def token_required(f):
         except Exception as e:
             return jsonify({"error": str(e)}), 401
 
-        # Step 3: Pass user email as dictionary to the route
+        # ✅ FIX HERE
         return f({"email": current_user_email}, *args, **kwargs)
 
     return decorated

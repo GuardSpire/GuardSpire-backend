@@ -11,6 +11,11 @@ delete_bp = Blueprint('delete', __name__)
 def save_delete_reason(current_user):
     try:
         email = current_user["email"]
+
+        # 🛠 Add this FIX
+        if isinstance(email, dict) and "email" in email:
+            email = email["email"]
+
         email_key = email.replace(".", "_").replace("@", "_")
         data = request.get_json()
 
@@ -23,6 +28,7 @@ def save_delete_reason(current_user):
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
 
 #-----------------Confirm Password (2 attempts)-------------------
 @delete_bp.route('/confirm-password', methods=['POST'])
@@ -30,17 +36,31 @@ def save_delete_reason(current_user):
 def confirm_password(current_user):
     try:
         email = current_user["email"]
+        if isinstance(email, dict) and "email" in email:
+            email = email["email"]  # Fix if email is a dict
+
         data = request.get_json()
         raw_password = data.get("password")
 
         if not raw_password:
             return jsonify({"error": "Password required"}), 400
 
-        auth.sign_in_with_email_and_password(email, raw_password)
+        # 🛑 Fix here: No Firebase auth call. Only Realtime Database check
+        email_key = email.replace('.', '_').replace('@', '_')
+        user_data = db.child("user_info").child(email_key).get().val()
+
+        if not user_data:
+            return jsonify({"error": "User not found"}), 404
+
+        if user_data.get("password") != raw_password:
+            return jsonify({"error": "Incorrect password"}), 403
+
         return jsonify({"message": "Password correct"}), 200
 
-    except Exception:
-        return jsonify({"error": "Incorrect password"}), 401
+    except Exception as e:
+        print(f"Error during password confirmation: {e}")
+        return jsonify({"error": str(e)}), 500
+
 
 #------------------------Send OTP-----------------------
 @delete_bp.route('/send-otp', methods=['POST'])
@@ -56,24 +76,6 @@ def send_otp(current_user):
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-#-------------Verify OTP------------------
-@delete_bp.route('/verify-otp', methods=['POST'])
-@token_required
-def verify_otp_for_delete(current_user):
-    try:
-        email = current_user["email"]
-        data = request.get_json()
-        otp = data.get("otp")
-
-        if not verify_otp(email, otp, "delete"):
-            return jsonify({"error": "Invalid OTP"}), 403
-
-        return jsonify({"message": "OTP verified"}), 200
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    
 
 #---------------------New password-------------------
 
@@ -103,6 +105,11 @@ def set_new_password(current_user):
 def delete_account(current_user):
     try:
         email = current_user["email"]
+
+        # 🛠 FIX HERE ALSO
+        if isinstance(email, dict) and "email" in email:
+            email = email["email"]
+
         email_key = email.replace(".", "_").replace("@", "_")
 
         db.child("scans").child(email_key).remove()
@@ -115,6 +122,7 @@ def delete_account(current_user):
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 #---------------------Delete Account -------------------
 @delete_bp.route('', methods=['DELETE'])

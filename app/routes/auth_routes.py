@@ -2,80 +2,89 @@ from flask import Blueprint, request, jsonify
 from app.services.firebase_service import db
 from app.services.firebase_service import auth
 from app.services.jwt_service import generate_jwt
+from app.utils.auth_decorator import token_required
 from app.services.otp_service import generate_otp, verify_otp
 
 auth_bp = Blueprint('auth', __name__)
 
-#-------------------Signup--------------------#
+# ------------------ Signup ------------------ #
 @auth_bp.route('/signup', methods=['POST'])
 def signup():
-    data = request.get_json()
-
     try:
-        # 1. Create user in Firebase using email + password
-        auth.create_user_with_email_and_password(data['email'], data['password'])
-
-        # 2. Save the username in user_info
+        data = request.get_json()
         email = data['email']
-        username = data.get('username', '')
+        username = data['username']
+        password = data['password']
+
         email_key = email.replace('.', '_').replace('@', '_')
+
+        # Save user data into Realtime Database
         db.child("user_info").child(email_key).set({
+            "username": username,
             "email": email,
-            "username": username
+            "password": password
         })
 
-        # 3. Generate an OTP for email verification
-        otp = generate_otp(email, "mfa")
+        # ✅ Generate OTP for signup
+        otp = generate_otp(email, "signup")
 
-        # 4. Return success response
-        return jsonify({
-            'message': 'User registered. Verify OTP.',
-            'otp': otp
-        }), 201
+        return jsonify({"message": "Signup successful. OTP sent", "otp": otp}), 201
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 400
-    
-#-------------------SignIn--------------------#
+        return jsonify({"error": str(e)}), 500
+
+# ------------------ SignIn ------------------ #
 @auth_bp.route('/signin', methods=['POST'])
 def signin():
-    data = request.get_json()
-
     try:
-        # 1. Try to sign in with Firebase
-        auth.sign_in_with_email_and_password(data['email'], data['password'])
+        data = request.get_json()
+        email = data['email']
+        password = data['password']
 
-        # 2. If credentials are correct, generate OTP for 2FA
-        otp = generate_otp(data['email'], "mfa")
+        email_key = email.replace('.', '_').replace('@', '_')
 
-        # 3. Return response
-        return jsonify({
-            'message': 'Login successful. Enter OTP to continue.',
-            'otp': otp
-        }), 200
+        user_record = db.child("user_info").child(email_key).get().val()
+
+        if not user_record:
+            return jsonify({"error": "User not found"}), 404
+
+        if user_record.get("password") != password:
+            return jsonify({"error": "Incorrect password"}), 403
+
+        # ✅ Generate OTP for login
+        otp = generate_otp(email, "login")
+
+        return jsonify({"message": "Sign in successful", "otp": otp}), 200
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 401
+        return jsonify({"error": str(e)}), 500
 
-#-------------------Verify OTP & JWT--------------------#
+
+# ------------------ OTP Verification ------------------ #
 @auth_bp.route('/verify-otp', methods=['POST'])
-def verify():
-    data = request.get_json()
+def verify_otp_route():
+    try:
+        data = request.get_json()
+        email = data['email']
+        otp = data['otp']
+        purpose = data.get('purpose')  # ✅ now expecting purpose too!
 
-    email = data.get('email')
-    otp = data.get('otp')
+        if not all([email, otp, purpose]):
+            return jsonify({"error": "Missing fields"}), 400
 
-    # Check OTP and purpose (MFA login)
-    if verify_otp(email, otp, "mfa"):
-        token = generate_jwt(email)
-        return jsonify({
-            'message': 'OTP verified successfully.',
-            'token': token
-        }), 200
-    else:
-        return jsonify({
-            'error': 'Invalid OTP or purpose.'
-        }), 403
+        verified = verify_otp(email, otp, purpose)
+
+        if not verified:
+            return jsonify({"error": "Invalid OTP or purpose."}), 403
+
+        # ✅ Correct: generate JWT token
+        token = generate_jwt({"email": email})
+
+        return jsonify({"message": "OTP verified successfully", "token": token}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 #-------------------Foregt Password-------------------#
 @auth_bp.route('/forgot-password/request', methods=['POST'])

@@ -10,33 +10,40 @@ account_bp = Blueprint('account', __name__)
 @token_required
 def update_user_info(current_user):
     try:
-        email = current_user['email']
-        email_key = email.replace('.', '_').replace('@', '_')
-        data = request.get_json()
+        email = current_user["email"]
+        
+        # Fix: If current_user is wrongly passed as dict with {"email": {"email": ...}}
+        if isinstance(email, dict) and "email" in email:
+            email = email["email"]
 
-        current_username = data.get('currentUsername')
-        new_username = data.get('newUsername')
+        email_key = email.replace(".", "_").replace("@", "_")
+        
+        data = request.get_json()
+        current_username = data.get("currentUsername")
+        new_username = data.get("newUsername")
 
         if not current_username or not new_username:
             return jsonify({"error": "Current and new usernames are required."}), 400
 
-        # Retrieve existing user info
-        existing_data = db.child("user_info").child(email_key).get().val() or {}
+        # Fetch existing user data correctly
+        user_info = db.child("user_info").child(email_key).get().val()
+        if not user_info:
+            return jsonify({"error": "User not found"}), 404
 
-        stored_username = existing_data.get("username")
-        if not stored_username:
-            return jsonify({"error": "User profile not found."}), 404
-
+        stored_username = user_info.get("username")
         if current_username != stored_username:
-            return jsonify({"error": "Current username is incorrect."}), 403
+            return jsonify({"error": "Current username is incorrect"}), 403
 
-        # Update username
-        db.child("user_info").child(email_key).update({"username": new_username})
+        # Update only inside user node
+        db.child("user_info").child(email_key).update({
+            "username": new_username
+        })
+
         return jsonify({"message": "Username updated successfully."}), 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
+    
 
 # ----------- Request OTP for Email/Password Update -----------
 @account_bp.route('/request-otp-update', methods=['POST'])
@@ -44,6 +51,9 @@ def update_user_info(current_user):
 def request_otp_for_update(current_user):
     try:
         email = current_user['email']
+        if isinstance(email, dict):  # ✅ FIX added
+            email = email.get('email', '')
+
         data = request.get_json()
         update_type = data.get("type")  # "email" or "password"
 
@@ -59,13 +69,17 @@ def request_otp_for_update(current_user):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 # ----------- Verify OTP and Apply Email/Password Update -----------
 @account_bp.route('/verify-update-otp', methods=['POST'])
 @token_required
 def verify_update_otp(current_user):
     try:
         email = current_user["email"]
+
+        # Fix if email dict issue
+        if isinstance(email, dict) and "email" in email:
+            email = email["email"]
+
         data = request.get_json()
 
         otp = data.get("otp")
@@ -74,6 +88,8 @@ def verify_update_otp(current_user):
         if not verify_otp(email, otp, update_type):
             return jsonify({"error": "Invalid OTP"}), 403
 
+        email_key = email.replace(".", "_").replace("@", "_")
+        
         if update_type == "email":
             current_email = data.get("currentEmail")
             new_email = data.get("newEmail")
@@ -84,8 +100,20 @@ def verify_update_otp(current_user):
             if email != current_email:
                 return jsonify({"error": "Current email does not match the logged-in user"}), 400
 
-            email_key = email.replace(".", "_").replace("@", "_")
-            db.child("user_info").child(email_key).update({"email": new_email})
+            new_email_key = new_email.replace(".", "_").replace("@", "_")
+
+            # Fetch current user data
+            user_data = db.child("user_info").child(email_key).get().val()
+            if not user_data:
+                return jsonify({"error": "User profile not found"}), 404
+
+            # Update email inside user info
+            user_data["email"] = new_email
+
+            # Create new node and delete old one
+            db.child("user_info").child(new_email_key).set(user_data)
+            db.child("user_info").child(email_key).remove()
+
             return jsonify({"message": "Email updated successfully"}), 200
 
         elif update_type == "password":
@@ -95,8 +123,16 @@ def verify_update_otp(current_user):
             if not current_password or not new_password:
                 return jsonify({"error": "Both current and new passwords are required"}), 400
 
-            user = auth.sign_in_with_email_and_password(email, current_password)
-            auth.update_user_password(user['idToken'], new_password)
+            # Verify password manually from database (Firebase auth removed)
+            user_data = db.child("user_info").child(email_key).get().val()
+            if not user_data:
+                return jsonify({"error": "User profile not found"}), 404
+
+            if user_data.get("password") != current_password:
+                return jsonify({"error": "Current password is incorrect"}), 403
+
+            # Update password
+            db.child("user_info").child(email_key).update({"password": new_password})
             return jsonify({"message": "Password updated successfully"}), 200
 
         return jsonify({"error": "Unsupported update type"}), 400
