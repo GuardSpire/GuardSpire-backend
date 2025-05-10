@@ -26,7 +26,8 @@ def create_app():
     app.register_blueprint(scan_bp, url_prefix='/api/scan')
     app.register_blueprint(account_bp, url_prefix='/api/account')
     app.register_blueprint(delete_bp, url_prefix='/api/delete')
-    
+    app.config['VIRUSTOTAL_API_KEY'] = os.getenv('VIRUSTOTAL_API_KEY')
+    app.config['GOOGLE_SAFE_BROWSING_API_KEY'] = os.getenv('GOOGLE_SAFE_BROWSING_API_KEY')
 
         # Debug print
     print("✅ Registered Routes:")

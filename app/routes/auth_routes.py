@@ -28,6 +28,8 @@ def signup():
         # ✅ Generate OTP for signup
         otp = generate_otp(email, "signup")
 
+        print(f"[DEBUG] OTP for {email}: {otp}")
+
         return jsonify({"message": "Signup successful. OTP sent", "otp": otp}), 201
 
     except Exception as e:
@@ -53,6 +55,8 @@ def signin():
 
         # ✅ Generate OTP for login
         otp = generate_otp(email, "login")
+
+        print(f"🔥[DEBUG] OTP for {email}: {otp}🔥")
 
         return jsonify({"message": "Sign in successful", "otp": otp}), 200
 

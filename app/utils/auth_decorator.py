@@ -21,7 +21,8 @@ def token_required(f):
         try:
             decoded_token = jwt.decode(token, os.getenv("JWT_SECRET_KEY"), algorithms=["HS256"])
             current_user_email = decoded_token.get("email")
-            if not current_user_email:
+
+            if not current_user_email or not isinstance(current_user_email, str):
                 return jsonify({"error": "Invalid token data"}), 401
 
         except jwt.ExpiredSignatureError:
@@ -31,7 +32,6 @@ def token_required(f):
         except Exception as e:
             return jsonify({"error": str(e)}), 401
 
-        # ✅ FIX HERE
         return f({"email": current_user_email}, *args, **kwargs)
 
     return decorated

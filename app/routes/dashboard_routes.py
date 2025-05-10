@@ -93,8 +93,8 @@ def recent_alerts(current_user):
         email = current_user['email']
         email_key = email.replace(".", "_").replace("@", "_")
 
-        all_data = db.get("manual_scans")
-        all_scans = all_data.val().get("manual_scans", {})
+        all_data = db.get("scam_records")
+        all_scans = all_data.val().get("scam_records", {})
 
         user_alerts = all_scans.get(email_key, {})
 

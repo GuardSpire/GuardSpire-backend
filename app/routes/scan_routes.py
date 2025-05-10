@@ -1,92 +1,180 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
+import datetime
+import requests
+import uuid
 from app.services.firebase_service import db
 from app.utils.auth_decorator import token_required
-import datetime
+from app.services.url_scanner import URLScanner
 
-scan_bp = Blueprint('scan', __name__)
+scan_bp = Blueprint('scan_bp', __name__)
+NLP_SERVICE_URL = "http://localhost:5001/analyze"
 
-#-------------------Create Manual Scan Record--------------------#
+
+#-------------------Manual Scan--------------------#
 @scan_bp.route('/manual', methods=['POST'])
 @token_required
 def manual_scan_create(current_user):
     try:
-        email = current_user['email']
-        email_key = email.replace(".", "_").replace("@", "_")
-
-        data = request.json
-        input_text = data.get('inputText', '').strip()
-
+        # Initialize scanner with current app context
+        url_scanner = URLScanner(current_app._get_current_object())
+        
+        data = request.get_json()
+        input_text = data.get('input', data.get('inputText', '')).strip()
+        user_email = current_user['email']
+        
         if not input_text:
             return jsonify({"error": "Input text is required"}), 400
 
-        # ✅ Correct Scan Record (with alertType placeholder)
-        scan_record = {
+        # URL analysis
+        urls = url_scanner.extract_urls(input_text)
+        url_analysis = []
+        max_url_threat = 0.0
+        url_threat_details = {}
+
+        if urls:
+            for url in urls:
+                try:
+                    analysis = url_scanner.analyze_url(url)
+                    url_analysis.append(analysis)
+                    if analysis['threat_score'] > max_url_threat:
+                        max_url_threat = analysis['threat_score']
+                        url_threat_details = {
+                            'category': analysis['category'],
+                            'confidence': analysis['confidence'],
+                            'source': 'url_scan',
+                            'details': analysis.get('details', {})
+                        }
+                except Exception as e:
+                    current_app.logger.error(f"URL analysis failed for {url}: {str(e)}")
+                    url_analysis.append({
+                        'url': url,
+                        'error': str(e),
+                        'threat_score': 0,
+                        'category': 'Stable',
+                        'confidence': '0%'
+                    })
+
+        response = {
+            "scan_id": str(uuid.uuid4()),
             "input": input_text,
+            "user": user_email,
             "timestamp": datetime.datetime.utcnow().isoformat(),
-            "status": "pending",
-            "matched": None,
-            "platform": None,
-            "threatLevel": None,
-            "description": None,
-            "alertType": None  # Placeholder, will be filled later
+            "contains_urls": bool(urls),
+            "url_analysis": url_analysis if urls else None,
+            "warnings": []
         }
 
-        all_data = db.get("manual_scans")
-        db_root = all_data.val() or {}
+        # NLP analysis only if URLs are safe
+        if not urls or max_url_threat < 4:
+            try:
+                nlp_response = requests.post(
+                    NLP_SERVICE_URL,
+                    json={'text': input_text},
+                    timeout=10
+                )
+                nlp_response.raise_for_status()
+                nlp_data = nlp_response.json()
+                
+                try:
+                    confidence = float(nlp_data['confidence'].strip('%')) / 100
+                    threat_level = float(nlp_data.get('threat_level', 0))
+                    
+                    response['text_analysis'] = {
+                        "is_scam": nlp_data['label'] == "SCAM",
+                        "confidence": confidence,
+                        "threat_level": threat_level,
+                        "category": (
+                            "Critical" if confidence >= 0.75 else
+                            "Suspicious" if confidence >= 0.5 else
+                            "Stable"
+                        ) if nlp_data['label'] == "SCAM" else "Legitimate",
+                        "description": f"Classified as {nlp_data['label']} (Confidence: {nlp_data['confidence']})"
+                    }
 
-        if "manual_scans" not in db_root:
-            db_root["manual_scans"] = {}
+                    if not urls:
+                        response['combined_threat'] = {
+                            "score": threat_level,
+                            "category": response['text_analysis']['category'],
+                            "confidence": nlp_data['confidence'],
+                            "source": "text_analysis"
+                        }
 
-        if email_key not in db_root["manual_scans"]:
-            db_root["manual_scans"][email_key] = {}
+                except (KeyError, ValueError) as e:
+                    response['warnings'].append(f"NLP response parsing failed: {str(e)}")
+                    current_app.logger.warning(f"NLP response parsing error: {str(e)}")
 
-        db.child("manual_scans").child(email_key).push(scan_record)
+            except requests.exceptions.RequestException as e:
+                response['warnings'].append(f"NLP service unavailable: {str(e)}")
+                current_app.logger.error(f"NLP service error: {str(e)}")
+            except Exception as e:
+                response['warnings'].append(f"Unexpected NLP error: {str(e)}")
+                current_app.logger.error(f"Unexpected NLP error: {str(e)}")
 
-        return jsonify({"message": "Scan recorded successfully", "data": scan_record}), 201
+        # Set combined threat if dangerous URLs found
+        if urls and max_url_threat >= 4:
+            response['combined_threat'] = {
+                "score": max_url_threat,
+                "category": url_threat_details.get('category', 'Suspicious'),
+                "confidence": url_threat_details.get('confidence', '0%'),
+                "source": "url_scan",
+                "details": url_threat_details.get('details', {})
+            }
 
+        # Save to Firebase
+        try:
+            email_key = user_email.replace(".", "_").replace("@", "_")
+            db.child("scans").child(email_key).push({
+                **response,
+                "status": "completed"
+            })
+        except Exception as e:
+            error_msg = f"Firebase save failed: {str(e)}"
+            response['warnings'].append(error_msg)
+            current_app.logger.error(error_msg)
+
+        return jsonify(response), 200
+        
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-#-------------------Report Latest Scam--------------------#
-@scan_bp.route('/manual/report/latest', methods=['GET'])
+        current_app.logger.error(f"Scan failed: {str(e)}")
+        return jsonify({
+            "error": "Scan failed",
+            "details": str(e)
+        }), 500
+    
+#-------------------Get Scan Report--------------------#
+@scan_bp.route('/manual/report/<scan_id>', methods=['GET'])
 @token_required
-def get_manual_report_latest(current_user):
+def get_manual_report(current_user, scan_id):
     try:
         email = current_user["email"]
         email_key = email.replace(".", "_").replace("@", "_")
 
-        all_data = db.get("manual_scans")
-        user_scans = all_data.val().get("manual_scans", {}).get(email_key)
+        scan_data = db.child("manual_scans").child(email_key).child(scan_id).get().val()
 
-        if not user_scans:
-            return jsonify({"message": "No manual scan records found"}), 404
+        if not scan_data:
+            return jsonify({"message": "Scan record not found"}), 404
 
-        if isinstance(user_scans, list):
-            user_scans = {str(i): scan for i, scan in enumerate(user_scans)}
-
-        latest_key = max(user_scans.keys(), key=lambda x: int(x))
-        latest_entry = user_scans[latest_key]
+        # Determine threat category based on percentage
+        threat_percentage = scan_data.get('threatPercentage', 0)
+        if threat_percentage >= 0.75:
+            threat_category = "Critical"
+        elif threat_percentage >= 0.5:
+            threat_category = "Suspicious"
+        else:
+            threat_category = "Stable"
 
         full_report = {
-            "type": latest_entry.get("type", "Unknown"),
-            "platform": latest_entry.get("platform", "Unspecified Platform"),
-            "url": latest_entry.get("url", "Unknown"),
-            "threatLevel": latest_entry.get("status", "Unknown").capitalize(),  # ✅ status: critical → Critical
-            "description": latest_entry.get("description", "No description available."),
-            "indicators": [
-                "URL does not match official site.",
-                "Request for personal/banking info.",
-                "Too-good-to-be-true discounts.",
-                "Pop-ups or suspicious design."
-            ],
-            "actions": [
-                "Avoid entering any personal data.",
-                "Close the page immediately.",
-                "Report this scam to authorities.",
-                "Change passwords and monitor accounts."
-            ],
-            "threatPercentage": latest_entry.get("threatPercentage", 1)  # ✅ Dynamic
+            "scanId": scan_id,
+            "type": scan_data.get('alertType', 'Unknown').capitalize(),
+            "input": scan_data.get('input', ''),
+            "timestamp": scan_data.get('timestamp', ''),
+            "threatLevel": scan_data.get('threatLevel', 'Unknown'),
+            "threatPercentage": threat_percentage,
+            "threatCategory": threat_category,
+            "description": scan_data.get('description', 'No description available.'),
+            "indicators": get_indicators(scan_data.get('alertType')),
+            "actions": get_recommended_actions(scan_data.get('alertType')),
+            "status": scan_data.get('status', 'unknown')
         }
 
         return jsonify(full_report), 200
@@ -94,6 +182,36 @@ def get_manual_report_latest(current_user):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+def get_indicators(alert_type):
+    if alert_type == "phishing":
+        return [
+            "Content matches known scam patterns",
+            "Request for personal/banking info detected",
+            "Suspicious language patterns identified",
+            "High probability of malicious intent"
+        ]
+    return [
+        "No immediate threats detected",
+        "Content appears legitimate",
+        "Low risk indicators present"
+    ]
+
+def get_recommended_actions(alert_type):
+    if alert_type == "phishing":
+        return [
+            "Do not respond to or interact with this content",
+            "Report this content to authorities if applicable",
+            "Change passwords if any credentials were shared",
+            "Monitor accounts for suspicious activity"
+        ]
+    return [
+        "No immediate action required",
+        "Remain vigilant for suspicious content",
+        "Report any suspicious variations of this content"
+    ]
+
+
+ 
 #-------------------History--------------------#
 @scan_bp.route('/history', methods=['GET'])
 @token_required
