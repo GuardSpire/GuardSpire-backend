@@ -4,6 +4,7 @@ from app.services.firebase_service import auth
 from app.services.jwt_service import generate_jwt
 from app.utils.auth_decorator import token_required
 from app.services.otp_service import generate_otp, verify_otp
+import re
 
 auth_bp = Blueprint('auth', __name__)
 
@@ -18,8 +19,8 @@ def signup():
 
         email_key = email.replace('.', '_').replace('@', '_')
 
-        # Save user data into Realtime Database
-        db.child("user_info").child(email_key).set({
+        # ✅ Save TEMP user data in Firebase (not actual users yet)
+        db.child("temp_users").child(email_key).set({
             "username": username,
             "email": email,
             "password": password
@@ -28,12 +29,13 @@ def signup():
         # ✅ Generate OTP for signup
         otp = generate_otp(email, "signup")
 
-        print(f"[DEBUG] OTP for {email}: {otp}")
+        print(f"🔥[DEBUG] OTP for {email}: {otp}🔥")
 
-        return jsonify({"message": "Signup successful. OTP sent", "otp": otp}), 201
+        return jsonify({"message": "Signup initiated. OTP sent", "otp": otp}), 201
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 # ------------------ SignIn ------------------ #
 @auth_bp.route('/signin', methods=['POST'])
@@ -71,7 +73,9 @@ def verify_otp_route():
         data = request.get_json()
         email = data['email']
         otp = data['otp']
-        purpose = data.get('purpose')  # ✅ now expecting purpose too!
+        purpose = data.get('purpose')
+
+        print(f"[DEBUG] Verifying OTP for: {email}, OTP: {otp}, Purpose: {purpose}")
 
         if not all([email, otp, purpose]):
             return jsonify({"error": "Missing fields"}), 400
@@ -79,9 +83,25 @@ def verify_otp_route():
         verified = verify_otp(email, otp, purpose)
 
         if not verified:
+            print("[DEBUG] OTP verification failed.")
             return jsonify({"error": "Invalid OTP or purpose."}), 403
 
-        # ✅ Correct: generate JWT token
+        email_key = email.replace('.', '_').replace('@', '_')
+
+        # ✅ If it's signup, transfer temp user to permanent storage
+        if purpose == "signup":
+            temp_user = db.child("temp_users").child(email_key).get().val()
+
+            if not temp_user:
+                return jsonify({"error": "No temporary signup data found."}), 404
+
+            # Save to actual user_info
+            db.child("user_info").child(email_key).set(temp_user)
+
+            # Cleanup temp data
+            db.child("temp_users").child(email_key).remove()
+
+        # ✅ Issue JWT token (login or signup)
         token = generate_jwt({"email": email})
 
         return jsonify({"message": "OTP verified successfully", "token": token}), 200
@@ -90,47 +110,90 @@ def verify_otp_route():
         return jsonify({"error": str(e)}), 500
 
 
-#-------------------Foregt Password-------------------#
+# ------------------- Forgot Password: Request OTP ------------------- #
 @auth_bp.route('/forgot-password/request', methods=['POST'])
 def forgot_password_request():
     try:
         data = request.get_json()
         email = data.get("email")
-        if not email:
-            return jsonify({"error": "Email is required"}), 400
+
+        # ✅ Validate email format
+        if not email or not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+            return jsonify({"error": "A valid email is required"}), 400
+
+        email_key = email.replace(".", "_").replace("@", "_")
+        user_data = db.child("user_info").child(email_key).get().val()
+
+        # ✅ Check if email exists
+        if not user_data:
+            return jsonify({"error": "Email not found"}), 404
 
         otp = generate_otp(email, "forgot")
+        print(f"🔥Generated OTP for forgot password request: {otp}🔥")
+
         return jsonify({"message": "OTP sent for password reset", "otp": otp}), 200
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    
+        return jsonify({"error": "Internal server error"}), 500
 
+
+# ------------------- Forgot Password: Verify OTP ------------------- #
+@auth_bp.route('/forgot-password/verify-otp', methods=['POST'])
+def verify_forgot_password_otp():
+    try:
+        data = request.get_json()
+        email = data.get("email")
+        otp = data.get("otp")
+
+        if not email or not otp:
+            return jsonify({"error": "Email and OTP are required"}), 400
+
+        # Print the OTP for debugging
+        print(f"🔥 Verifying OTP for email: {email}, OTP: {otp}")
+
+        if not verify_otp(email, otp, "forgot"):
+            print(f"❌ Invalid OTP provided: {otp}")
+            return jsonify({"error": "Invalid OTP"}), 403
+
+        print(f"✅ OTP verified successfully for email: {email}")
+        return jsonify({"message": "OTP verified"}), 200
+
+    except Exception as e:
+        print(f"❌ Exception occurred during OTP verification: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+# ------------------- Forgot Password: Reset Password ------------------- #
 @auth_bp.route('/forgot-password/reset', methods=['POST'])
 def reset_password():
     try:
         data = request.get_json()
         email = data.get("email")
-        otp = data.get("otp")
         new_password = data.get("newPassword")
         confirm_password = data.get("confirmPassword")
 
-        if not all([email, otp, new_password, confirm_password]):
+        if not all([email, new_password, confirm_password]):
             return jsonify({"error": "All fields are required"}), 400
 
         if new_password != confirm_password:
             return jsonify({"error": "Passwords do not match"}), 400
 
-        # ✅ Verify OTP
-        if not verify_otp(email, otp, "forgot"):
-            return jsonify({"error": "Invalid OTP"}), 403
+        # 🔍 Search under user_info to find the correct key
+        all_users = db.child("user_info").get().val()
+        matched_key = None
 
-        email_key = email.replace(".", "_").replace("@", "_")
+        for key, value in all_users.items():
+            if value.get("email") == email:
+                matched_key = key
+                break
 
-        # ✅ Update password in Realtime DB
-        db.child("user_info").child(email_key).update({"password": new_password})
+        if not matched_key:
+            return jsonify({"error": "User not found"}), 404
+
+        # ✅ Update password under the correct node
+        db.child("user_info").child(matched_key).update({"password": new_password})
 
         return jsonify({"message": "Password reset successful"}), 200
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Internal server error"}), 500

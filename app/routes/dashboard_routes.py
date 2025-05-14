@@ -5,30 +5,37 @@ from app.utils.auth_decorator import token_required
 
 dashboard_bp = Blueprint('dashboard', __name__)
 
-#-------------------Quick Scan--------------------#
-@dashboard_bp.route('/quick-scan', methods=['GET', 'OPTIONS'])
+# -------------------Quick Scan-------------------- #
+@dashboard_bp.route('/quick-scan', methods=['GET'])
 @token_required
 def quick_scan(current_user):
     try:
         email = current_user['email']
         email_key = email.replace('.', '_').replace('@', '_')
+        user_scans_raw = db.child("scans").child(email_key).get().val()
 
-        all_data = db.get()
-        db_root = all_data.val() or {}
+        if not user_scans_raw:
+            return jsonify({
+                "email": email,
+                "totalScanned": 0,
+                "scamsDetected": 0,
+                "protectionPercent": 100
+            }), 200
 
-        user_scans_raw = db_root.get("scans", {}).get(email_key)
+        # Filter out reported scans
+        filtered_scans = [
+            scan for scan in user_scans_raw.values()
+            if isinstance(scan, dict) and not scan.get("reported")
+        ]
 
-        if isinstance(user_scans_raw, list):
-            user_scans = {str(i): entry for i, entry in enumerate(user_scans_raw)}
-        elif isinstance(user_scans_raw, dict):
-            user_scans = user_scans_raw
-        else:
-            user_scans = {}
-
-        total = len(user_scans)
+        total = len(filtered_scans)
         scam_count = sum(
-            1 for scan in user_scans.values()
-            if isinstance(scan, dict) and scan.get("status") in ["scam", "suspicious"]
+            1 for scan in filtered_scans
+            if (
+                scan.get("combined_threat") and scan["combined_threat"].get("category") in ["Critical", "Suspicious"]
+            ) or (
+                scan.get("text_analysis") and scan["text_analysis"].get("category") in ["Critical", "Suspicious"]
+            )
         )
 
         protection = 100 if total == 0 else round((1 - scam_count / total) * 100)
@@ -43,38 +50,56 @@ def quick_scan(current_user):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
-#-------------------Security Model--------------------#
+# -------------------Security Model-------------------- #
 @dashboard_bp.route('/security-model', methods=['GET'])
 @token_required
 def security_model(current_user):
-
     try:
+        import json  # in case not already at top
         email = current_user['email']
         email_key = email.replace(".", "_").replace("@", "_")
+        user_scans_raw = db.child("scans").child(email_key).get().val()
 
-        all_data = db.get("scam_records")
+        if not user_scans_raw:
+            return jsonify({'stable': 0, 'suspicious': 0, 'critical': 0}), 200
 
-        scam_data = all_data.val()["scam_records"][email_key]
+        filtered_scans = [
+            scan for scan in user_scans_raw.values()
+            if isinstance(scan, dict) and not scan.get("reported")
+        ]
 
-        stable = suspicious = critical = total = 0
+        stable = suspicious = critical = unknown = 0
 
-        for item in scam_data:
-            category = item.get('category')
-            if category == 'stable':
+        for scan in filtered_scans:
+            category = None
+
+            # Prefer combined_threat
+            if isinstance(scan.get("combined_threat"), dict):
+                category = scan["combined_threat"].get("category")
+            # Fall back to text_analysis
+            if not category and isinstance(scan.get("text_analysis"), dict):
+                category = scan["text_analysis"].get("category")
+
+            # ✅ Normalize category
+            if category:
+                category = category.strip().lower()
+
+            # ✅ Map Legitimate to Stable
+            if category in ["legitimate", "stable"]:
                 stable += 1
-            elif category == 'suspicious':
+            elif category == "suspicious":
                 suspicious += 1
-            elif category == 'critical':
+            elif category == "critical":
                 critical += 1
-            total += 1
+            else:
+                unknown += 1
+
+        total = stable + suspicious + critical
+
+        print(f"[DEBUG] Total: {total}, Stable: {stable}, Suspicious: {suspicious}, Critical: {critical}, Unknown: {unknown}")
 
         if total == 0:
-            return jsonify({
-                'stable': 0,
-                'suspicious': 0,
-                'critical': 0
-            }), 200
+            return jsonify({'stable': 0, 'suspicious': 0, 'critical': 0}), 200
 
         return jsonify({
             'stable': round((stable / total) * 100),
@@ -83,9 +108,10 @@ def security_model(current_user):
         }), 200
 
     except Exception as e:
+        print(f"[ERROR] security_model(): {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-#-------------------Recent Alerts--------------------#
+# -------------------Recent Alerts-------------------- #
 @dashboard_bp.route('/recent-alerts', methods=['GET'])
 @token_required
 def recent_alerts(current_user):
@@ -93,30 +119,62 @@ def recent_alerts(current_user):
         email = current_user['email']
         email_key = email.replace(".", "_").replace("@", "_")
 
-        all_data = db.get("scam_records")
-        all_scans = all_data.val().get("scam_records", {})
+        # Fetch user's scan history
+        user_scans_raw = db.child("scans").child(email_key).get().val()
 
-        user_alerts = all_scans.get(email_key, {})
+        if not user_scans_raw:
+            return jsonify({"email": email, "recentAlerts": []}), 200
 
-        # Convert list-like to dict if needed
-        if isinstance(user_alerts, list):
-            user_alerts = {str(i): user_alerts[i] for i in range(len(user_alerts))}
+        # Filter out reported items
+        filtered_scans = [
+            scan for scan in user_scans_raw.values()
+            if isinstance(scan, dict) and not scan.get("reported")
+        ]
 
         # Sort by timestamp descending
         sorted_alerts = sorted(
-            user_alerts.values(),
+            filtered_scans,
             key=lambda x: x.get("timestamp", ""),
             reverse=True
         )
 
-        # Return the most recent 5
-        recent = sorted_alerts[:5]
+        # Format alerts to match dashboard UI expectations
+        formatted_alerts = []
+        for scan in sorted_alerts[:5]:
+            threat = scan.get("combined_threat") or scan.get("text_analysis") or {}
+            raw_conf = threat.get("confidence", "0%")
+
+            try:
+                confidence = float(str(raw_conf).replace("%", ""))
+            except ValueError:
+                confidence = 0
+
+            threat_category = threat.get("category", "Stable")
+            threat_level = (
+                "critical" if threat_category == "Critical" else
+                "suspicious" if threat_category == "Suspicious" else
+                "stable"
+            )
+
+            platform_label = (
+                "Scam Alert" if threat_category == "Critical" else
+                "Potential Threat" if threat_category == "Suspicious" else
+                "Legitimate"
+            )
+
+            formatted_alerts.append({
+                "platform": platform_label,
+                "threatLevel": threat_level,
+                "threatPercentage": confidence,
+                "scan_id": scan.get("scan_id"),
+                "timestamp": scan.get("timestamp"),
+                "input": scan.get("input", "")
+            })
 
         return jsonify({
             "email": email,
-            "recentAlerts": recent
+            "recentAlerts": formatted_alerts
         }), 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
