@@ -120,7 +120,7 @@ def manual_scan_create(current_user):
     except Exception as e:
         current_app.logger.error(f"Scan failed: {str(e)}", exc_info=True)
         return jsonify({"error": "Scan failed", "details": str(e)}), 500
-
+    
 #-------------------Get Scan Report--------------------#
 @scan_bp.route('/manual/report/<scan_id>', methods=['GET'])
 @token_required
@@ -138,32 +138,46 @@ def get_manual_report(current_user, scan_id):
             current_app.logger.error(f"Scan {scan_id} not found in database")
             return jsonify({"message": "Scan record not found"}), 404
 
+        # Prefer combined_threat, fall back to text_analysis
         threat_data = found_scan.get('combined_threat') or found_scan.get('text_analysis') or {}
-        confidence = str(threat_data.get('confidence', '0%'))
+
+        # Try to get confidence (as float)
+        confidence_raw = threat_data.get('confidence') or found_scan.get('text_analysis', {}).get('confidence', 0)
         try:
-            threat_percentage = float(confidence.strip('%')) / 100 if '%' in confidence else float(confidence)
+            threat_percentage = float(str(confidence_raw).strip('%')) if isinstance(confidence_raw, str) else float(confidence_raw)
         except ValueError:
             threat_percentage = 0
 
-        threat_category = (
-            "Critical" if threat_percentage >= 0.75 else
-            "Suspicious" if threat_percentage >= 0.5 else
-            "Stable"
-        )
+        # Use category from analysis if available
+        threat_category = threat_data.get('category') or found_scan.get('text_analysis', {}).get('category') or 'Legitimate'
 
-        alert_type = threat_data.get('category', 'manual')
+        # Map threat category to internal alert type
+        category_map = {
+            "critical": "phishing",
+            "suspicious": "phishing",
+            "legitimate": "legit",
+            "stable": "legit"
+        }
+        alert_type = category_map.get(threat_category.lower(), "legit")
+
+        # Use description from threat_data or fallback
+        description = (
+            threat_data.get('description') or
+            found_scan.get('text_analysis', {}).get('description') or
+            'No description available.'
+        )
 
         full_report = {
             "scanId": scan_id,
-            "type": alert_type.capitalize(),
+            "type": threat_category.capitalize(),
             "input": found_scan.get('input', ''),
             "timestamp": found_scan.get('timestamp', ''),
             "threatLevel": threat_data.get('score', threat_data.get('threat_level', 0)),
-            "threatPercentage": threat_percentage,
+            "threatPercentage": threat_percentage / 100 if threat_percentage > 1 else threat_percentage,
             "threatCategory": threat_category,
-            "description": threat_data.get('description', 'No description available.'),
-            "indicators": get_indicators(alert_type.lower()),
-            "actions": get_recommended_actions(alert_type.lower()),
+            "description": description,
+            "indicators": get_indicators(alert_type),
+            "actions": get_recommended_actions(alert_type),
             "status": found_scan.get('status', 'completed'),
             "source": threat_data.get('source', 'unknown'),
             "containsUrls": found_scan.get('contains_urls', False),
@@ -176,6 +190,7 @@ def get_manual_report(current_user, scan_id):
     except Exception as e:
         current_app.logger.error(f"Error retrieving scan report: {str(e)}", exc_info=True)
         return jsonify({"error": "Failed to retrieve scan report", "details": str(e)}), 500
+
 
 def get_indicators(alert_type):
     if alert_type == "phishing":
@@ -204,7 +219,6 @@ def get_recommended_actions(alert_type):
         "Remain vigilant for suspicious content",
         "Report any suspicious variations of this content"
     ]
-
 
 #-------------------Block & Report--------------------#
 @scan_bp.route('/manual/report/<scan_id>/report', methods=['POST'])

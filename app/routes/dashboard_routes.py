@@ -125,11 +125,15 @@ def recent_alerts(current_user):
         if not user_scans_raw:
             return jsonify({"email": email, "recentAlerts": []}), 200
 
-        # Filter out reported items
-        filtered_scans = [
-            scan for scan in user_scans_raw.values()
-            if isinstance(scan, dict) and not scan.get("reported")
-        ]
+        # Filter out reported items and remove duplicates by scan_id
+        seen_scan_ids = set()
+        filtered_scans = []
+        for scan in user_scans_raw.values():
+            if isinstance(scan, dict) and not scan.get("reported"):
+                scan_id = scan.get("scan_id")
+                if scan_id and scan_id not in seen_scan_ids:
+                    seen_scan_ids.add(scan_id)
+                    filtered_scans.append(scan)
 
         # Sort by timestamp descending
         sorted_alerts = sorted(
@@ -138,9 +142,9 @@ def recent_alerts(current_user):
             reverse=True
         )
 
-        # Format alerts to match dashboard UI expectations
+        # Format alerts to match dashboard UI expectations, limit to 10
         formatted_alerts = []
-        for scan in sorted_alerts[:5]:
+        for scan in sorted_alerts[:10]:  # Changed from [:5] to [:10]
             threat = scan.get("combined_threat") or scan.get("text_analysis") or {}
             raw_conf = threat.get("confidence", "0%")
 
