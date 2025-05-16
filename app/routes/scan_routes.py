@@ -18,17 +18,16 @@ def manual_scan_create(current_user):
         data = request.get_json()
         input_text = data.get('input', data.get('inputText', '')).strip()
         user_email = current_user['email']
+        scan_id = str(uuid.uuid4())
 
         if not input_text:
             return jsonify({"error": "Input text is required"}), 400
 
-        scan_id = str(uuid.uuid4())
-
         urls = url_scanner.extract_urls(input_text)
-        url_analysis = []
-        max_url_threat = 0.0
-        url_threat_details = {}
+        url_analysis, max_url_threat, text_threat = [], 0.0, 0.0
+        url_threat_details, nlp_data = {}, {}
 
+        # ----- URL Analysis -----
         if urls:
             for url in urls:
                 try:
@@ -38,12 +37,10 @@ def manual_scan_create(current_user):
                         max_url_threat = analysis['threat_score']
                         url_threat_details = {
                             'category': analysis['category'],
-                            'confidence': analysis['confidence'],
-                            'source': 'url_scan',
-                            'details': analysis.get('details', {})
+                            'details': analysis.get('details', {}),
+                            'source': 'url_scan'
                         }
                 except Exception as e:
-                    current_app.logger.error(f"URL analysis failed for {url}: {str(e)}")
                     url_analysis.append({
                         'url': url,
                         'error': str(e),
@@ -52,6 +49,43 @@ def manual_scan_create(current_user):
                         'confidence': '0%'
                     })
 
+        # ----- NLP Analysis -----
+        try:
+            nlp_response = requests.post(NLP_SERVICE_URL, json={'text': input_text}, timeout=10)
+            nlp_response.raise_for_status()
+            nlp_data = nlp_response.json()
+            text_threat = float(nlp_data.get('threat_level', 0))
+            confidence = float(nlp_data['confidence'].strip('%')) / 100
+
+            response_text = {
+                "is_scam": nlp_data['label'] == "SCAM",
+                "confidence": confidence,
+                "threat_level": text_threat,
+                "category": (
+                    "Critical" if confidence >= 0.75 else
+                    "Suspicious" if confidence >= 0.5 else
+                    "Stable"
+                ) if nlp_data['label'] == "SCAM" else "Legitimate",
+                "description": f"Classified as {nlp_data['label']} (Confidence: {nlp_data['confidence']})"
+            }
+        except Exception as e:
+            response_text = {}
+            current_app.logger.error(f"NLP analysis error: {str(e)}")
+
+        # ----- Combined Logic -----
+        if urls:
+            final_score = max(max_url_threat, text_threat * 0.3)
+            source = "url_scan"
+            base = url_threat_details
+        else:
+            final_score = max(text_threat, max_url_threat * 0.3)
+            source = "text_analysis"
+            base = {
+                'category': response_text.get('category', 'Stable'),
+                'details': {},
+                'source': source
+            }
+
         response = {
             "scan_id": scan_id,
             "input": input_text,
@@ -59,50 +93,20 @@ def manual_scan_create(current_user):
             "timestamp": datetime.datetime.utcnow().isoformat(),
             "contains_urls": bool(urls),
             "url_analysis": url_analysis if urls else None,
+            "text_analysis": response_text if response_text else None,
+            "combined_threat": {
+                "score": round(final_score, 2),
+                "category": (
+                    "Critical" if final_score >= 7 else
+                    "Suspicious" if final_score >= 4 else
+                    "Stable"
+                ),
+                "confidence": f"{(final_score / 9.5) * 100:.1f}%",
+                "source": source,
+                "details": base.get("details", {})
+            },
             "warnings": []
         }
-
-        if not urls or max_url_threat < 4:
-            try:
-                nlp_response = requests.post(NLP_SERVICE_URL, json={'text': input_text}, timeout=10)
-                nlp_response.raise_for_status()
-                nlp_data = nlp_response.json()
-
-                confidence = float(nlp_data['confidence'].strip('%')) / 100
-                threat_level = float(nlp_data.get('threat_level', 0))
-
-                response['text_analysis'] = {
-                    "is_scam": nlp_data['label'] == "SCAM",
-                    "confidence": confidence,
-                    "threat_level": threat_level,
-                    "category": (
-                        "Critical" if confidence >= 0.75 else
-                        "Suspicious" if confidence >= 0.5 else
-                        "Stable"
-                    ) if nlp_data['label'] == "SCAM" else "Legitimate",
-                    "description": f"Classified as {nlp_data['label']} (Confidence: {nlp_data['confidence']})"
-                }
-
-                if not urls:
-                    response['combined_threat'] = {
-                        "score": threat_level,
-                        "category": response['text_analysis']['category'],
-                        "confidence": nlp_data['confidence'],
-                        "source": "text_analysis"
-                    }
-
-            except Exception as e:
-                response['warnings'].append(f"NLP analysis failed: {str(e)}")
-                current_app.logger.error(f"NLP analysis error: {str(e)}")
-
-        if urls and max_url_threat >= 4:
-            response['combined_threat'] = {
-                "score": max_url_threat,
-                "category": url_threat_details.get('category', 'Suspicious'),
-                "confidence": url_threat_details.get('confidence', '0%'),
-                "source": "url_scan",
-                "details": url_threat_details.get('details', {})
-            }
 
         try:
             email_key = user_email.replace(".", "_").replace("@", "_")
@@ -111,15 +115,14 @@ def manual_scan_create(current_user):
                 "status": "completed"
             })
         except Exception as e:
-            error_msg = f"Firebase save failed: {str(e)}"
-            response['warnings'].append(error_msg)
-            current_app.logger.error(error_msg)
+            response['warnings'].append(f"Firebase save failed: {str(e)}")
 
         return jsonify(response), 200
 
     except Exception as e:
         current_app.logger.error(f"Scan failed: {str(e)}", exc_info=True)
         return jsonify({"error": "Scan failed", "details": str(e)}), 500
+
     
 #-------------------Get Scan Report--------------------#
 @scan_bp.route('/manual/report/<scan_id>', methods=['GET'])
@@ -324,19 +327,17 @@ def notification_realtime_scan(current_user):
     try:
         url_scanner = URLScanner(current_app._get_current_object())
         data = request.get_json()
-
         input_text = data.get('text', '').strip()
         urls = data.get('urls', [])
         user_email = current_user.get('email')
+        scan_id = str(uuid.uuid4())
+        timestamp = datetime.datetime.utcnow().isoformat()
 
         if not input_text and not urls:
             return jsonify({"error": "No input data"}), 400
 
-        scan_id = str(uuid.uuid4())
-        timestamp = datetime.datetime.utcnow().isoformat()
-        url_analysis = []
-        max_url_threat = 0.0
-        url_threat_details = {}
+        url_analysis, max_url_threat, text_threat = [], 0.0, 0.0
+        url_threat_details, nlp_data = {}, {}
 
         # ---- URL Analysis ----
         if urls:
@@ -348,12 +349,10 @@ def notification_realtime_scan(current_user):
                         max_url_threat = analysis['threat_score']
                         url_threat_details = {
                             'category': analysis['category'],
-                            'confidence': analysis['confidence'],
-                            'source': 'url_scan',
-                            'details': analysis.get('details', {})
+                            'details': analysis.get('details', {}),
+                            'source': 'url_scan'
                         }
                 except Exception as e:
-                    current_app.logger.warning(f"URL analysis failed for {url}: {str(e)}")
                     url_analysis.append({
                         'url': url,
                         'error': str(e),
@@ -362,6 +361,43 @@ def notification_realtime_scan(current_user):
                         'confidence': '0%'
                     })
 
+        # ---- NLP Analysis ----
+        try:
+            nlp_response = requests.post(NLP_SERVICE_URL, json={'text': input_text}, timeout=10)
+            nlp_response.raise_for_status()
+            nlp_data = nlp_response.json()
+            text_threat = float(nlp_data.get('threat_level', 0))
+            confidence = float(nlp_data['confidence'].strip('%')) / 100
+
+            response_text = {
+                "is_scam": nlp_data['label'] == "SCAM",
+                "confidence": confidence,
+                "threat_level": text_threat,
+                "category": (
+                    "Critical" if confidence >= 0.75 else
+                    "Suspicious" if confidence >= 0.5 else
+                    "Stable"
+                ) if nlp_data['label'] == "SCAM" else "Stable",
+                "description": f"Classified as {nlp_data['label']} (Confidence: {nlp_data['confidence']})"
+            }
+        except Exception as e:
+            response_text = {}
+            current_app.logger.error(f"NLP analysis error: {str(e)}")
+
+        # ---- Combine Logic ----
+        if urls:
+            final_score = max(max_url_threat, text_threat * 0.3)
+            source = "url_scan"
+            base = url_threat_details
+        else:
+            final_score = max(text_threat, max_url_threat * 0.3)
+            source = "text_analysis"
+            base = {
+                'category': response_text.get('category', 'Stable'),
+                'details': {},
+                'source': source
+            }
+
         response = {
             "scan_id": scan_id,
             "input": input_text,
@@ -369,52 +405,21 @@ def notification_realtime_scan(current_user):
             "timestamp": timestamp,
             "contains_urls": bool(urls),
             "url_analysis": url_analysis if urls else None,
-            "warnings": []
+            "text_analysis": response_text if response_text else None,
+            "combined_threat": {
+                "score": round(final_score, 2),
+                "category": (
+                    "Critical" if final_score >= 7 else
+                    "Suspicious" if final_score >= 4 else
+                    "Stable"
+                ),
+                "confidence": f"{(final_score / 9.5) * 100:.1f}%",
+                "source": source,
+                "details": base.get("details", {})
+            },
+            "warnings": [],
+            "show_warning": final_score >= 0.5
         }
-
-        # ---- NLP Analysis if safe URLs ----
-        if not urls or max_url_threat < 4:
-            try:
-                nlp_response = requests.post(NLP_SERVICE_URL, json={'text': input_text}, timeout=10)
-                nlp_response.raise_for_status()
-                nlp_data = nlp_response.json()
-
-                confidence = float(nlp_data['confidence'].strip('%')) / 100
-                threat_level = float(nlp_data.get('threat_level', 0))
-
-                response['text_analysis'] = {
-                    "is_scam": nlp_data['label'] == "SCAM",
-                    "confidence": confidence,
-                    "threat_level": threat_level,
-                    "category": (
-                        "Critical" if confidence >= 0.75 else
-                        "Suspicious" if confidence >= 0.5 else
-                        "Stable"
-                    ) if nlp_data['label'] == "SCAM" else "Stable",
-                    "description": f"Classified as {nlp_data['label']} (Confidence: {nlp_data['confidence']})"
-                }
-
-                if not urls:
-                    response['combined_threat'] = {
-                        "score": threat_level,
-                        "category": response['text_analysis']['category'],
-                        "confidence": nlp_data['confidence'],
-                        "source": "text_analysis"
-                    }
-
-            except Exception as e:
-                response['warnings'].append(f"NLP analysis failed: {str(e)}")
-                current_app.logger.error(f"NLP analysis error: {str(e)}")
-
-        # ---- Combined Threat from URL if High Threat ----
-        if urls and max_url_threat >= 4:
-            response['combined_threat'] = {
-                "score": max_url_threat,
-                "category": url_threat_details.get('category', 'Suspicious'),
-                "confidence": url_threat_details.get('confidence', '0%'),
-                "source": "url_scan",
-                "details": url_threat_details.get('details', {})
-            }
 
         # ---- Save to Firebase ----
         try:
@@ -424,20 +429,14 @@ def notification_realtime_scan(current_user):
                 "status": "completed"
             })
         except Exception as e:
-            error_msg = f"Firebase save failed: {str(e)}"
-            response['warnings'].append(error_msg)
-            current_app.logger.error(error_msg)
-
-        # ---- Add show_warning for client popup
-        threat_data = response.get('combined_threat') or response.get('text_analysis') or {}
-        score = threat_data.get('score') or threat_data.get('threat_level', 0)
-        response['show_warning'] = score >= 0.5
+            response['warnings'].append(f"Firebase save failed: {str(e)}")
 
         return jsonify(response), 200
 
     except Exception as e:
         current_app.logger.error(f"/notification/scan failed: {str(e)}", exc_info=True)
         return jsonify({"error": str(e)}), 500
+
 
 
 #-------------------History--------------------#
